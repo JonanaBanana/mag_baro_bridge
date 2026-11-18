@@ -98,7 +98,6 @@ and resumes when data comes back.
 | `bind_address` | `127.0.0.1` | |
 | `frame_id` | `base_link` | |
 | `frd_to_flu` | `true` | Convert PX4 FRD body frame to ROS FLU |
-| `poll_rate_hz` | `200.0` | Socket polling rate |
 | `timeout_s` | `2.0` | Warn if no HIGHRES_IMU for this long |
 
 Launch arguments: `udp_port`, `frame_id`, `namespace` (default `px4`).

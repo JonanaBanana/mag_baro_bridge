@@ -6,9 +6,14 @@ produced a new sample. This node publishes each sensor only on fresh data.
 
 The MAVLink decoding is done here with the standard library (no pymavlink):
 only HIGHRES_IMU (msgid 105) is parsed, and its CRC is checked.
+
+Packets are received on a background thread that blocks in recv(), so the node
+only wakes up when PX4 sends data. (A high-rate rclpy timer polling the socket
+cost ~50% of a core on the VOXL2 with Foxy.)
 """
 import socket
 import struct
+import threading
 
 import rclpy
 from rclpy.node import Node
@@ -107,7 +112,6 @@ class MagBaroBridge(Node):
         self.declare_parameter('frame_id', 'base_link')
         # PX4 body frame is FRD; ROS convention (REP-103) is FLU.
         self.declare_parameter('frd_to_flu', True)
-        self.declare_parameter('poll_rate_hz', 200.0)
         self.declare_parameter('timeout_s', 2.0)
 
         addr = self.get_parameter('bind_address').value
@@ -115,7 +119,6 @@ class MagBaroBridge(Node):
         self.frame_id = self.get_parameter('frame_id').value
         self.frd_to_flu = self.get_parameter('frd_to_flu').value
         self.timeout_ns = int(self.get_parameter('timeout_s').value * 1e9)
-        poll_rate = self.get_parameter('poll_rate_hz').value
 
         qos = qos_profile_sensor_data
         self.mag_pub = self.create_publisher(MagneticField, 'mag', qos)
@@ -125,7 +128,9 @@ class MagBaroBridge(Node):
 
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.sock.bind((addr, port))
-        self.sock.setblocking(False)
+        # Blocking recv with a timeout: wakes on data, or periodically to check
+        # the no-data warning and shutdown
+        self.sock.settimeout(0.5)
         self.get_logger().info(f'Listening for MAVLink on udp {addr}:{port}')
 
         self.last_rx_ns = self.get_clock().now().nanoseconds
@@ -135,14 +140,26 @@ class MagBaroBridge(Node):
         self.rx_datagrams = 0
         self.seen_ids = set()
 
-        self.create_timer(1.0 / poll_rate, self.poll)
+        self._stop = threading.Event()
+        self._rx_thread = threading.Thread(target=self._rx_loop, name='mavlink_rx', daemon=True)
+        self._rx_thread.start()
 
-    def poll(self):
-        while True:
+    def stop(self):
+        self._stop.set()
+        self._rx_thread.join(timeout=2.0)
+        self.sock.close()
+
+    def _rx_loop(self):
+        while not self._stop.is_set() and rclpy.ok():
             try:
                 data = self.sock.recv(4096)
-            except (BlockingIOError, InterruptedError):
-                break
+            except socket.timeout:
+                self._check_timeout()
+                continue
+            except InterruptedError:
+                continue
+            except OSError:
+                break  # socket closed during shutdown
             self.rx_datagrams += 1
             msgs, errs, ids = parse_highres_imu(data)
             self.seen_ids |= ids
@@ -151,7 +168,9 @@ class MagBaroBridge(Node):
                 self.get_logger().warn(f'MAVLink CRC errors: {self.crc_errors} total')
             for m in msgs:
                 self.on_highres_imu(m)
+            self._check_timeout()
 
+    def _check_timeout(self):
         now = self.get_clock().now().nanoseconds
         if now - self.last_rx_ns > self.timeout_ns and now - self.last_warn_ns > 5e9:
             self.last_warn_ns = now
@@ -218,7 +237,7 @@ def main(args=None):
     except KeyboardInterrupt:
         pass
     finally:
-        node.sock.close()
+        node.stop()
         node.destroy_node()
         if rclpy.ok():
             rclpy.shutdown()
